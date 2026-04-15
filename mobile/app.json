@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Corridoor",
+    "slug": "corridoor",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./src/assets/corridoor_logo.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "backgroundColor": "#FF461A"
+    },
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FF461A"
+      },
+      "package": "com.corridoor.app"
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+.buildings-page__search {
+  padding: var(--space-3) var(--space-5);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius-full);
+  font-family: var(--font-primary);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  width: 280px;
+  transition: all var(--transition-fast);
+  outline: none;
+}
+
+.buildings-page__search:focus {
+  border-color: var(--brand-primary);
+  box-shadow: 0 0 0 3px var(--input-focus-ring);
+}
+
+.buildings-page__search::placeholder {
+  color: var(--text-tertiary);
+}
+
+.buildings-page__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: var(--space-5);
+}
+
+.buildings-page__grid > div {
+  animation: fadeIn 0.4s ease both;
+}

@@ -1,0 +1,27 @@
+.encryption-badge {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-success-bg);
+  border: 1px solid var(--color-success);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--space-6);
+}
+
+.encryption-badge__icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.encryption-badge__title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-success);
+  display: block;
+}
+
+.encryption-badge__sub {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
