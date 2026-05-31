@@ -1,44 +1,45 @@
 import { useState, useRef } from 'react';
-import { uploadNOC } from '../../utils/api';
+import { uploadNOC, uploadFloorplan } from '../../utils/api';
 import StatusBadge from '../common/StatusBadge';
 import './NOCUpload.css';
 
 export default function NOCUpload() {
-  const [file, setFile] = useState(null);
+  // Step 1: NOC upload
+  const [nocFile, setNocFile] = useState(null);
   const [uploading, setUploading] = useState(false);
-  const [result, setResult] = useState(null);
+  const [nocResult, setNocResult] = useState(null);
   const [error, setError] = useState(null);
-  const inputRef = useRef(null);
+  const nocInputRef = useRef(null);
 
-  const handleDrop = (e) => {
+  // Step 2: Floorplan upload
+  const [fpFile, setFpFile] = useState(null);
+  const [fpUploading, setFpUploading] = useState(false);
+  const [fpResult, setFpResult] = useState(null);
+  const [fpError, setFpError] = useState(null);
+  const fpInputRef = useRef(null);
+
+  const handleNocDrop = (e) => {
     e.preventDefault();
     const dropped = e.dataTransfer.files[0];
     if (dropped?.type === 'application/pdf') {
-      setFile(dropped);
+      setNocFile(dropped);
       setError(null);
     } else {
       setError('Only PDF files are accepted');
     }
   };
 
-  const handleSelect = (e) => {
-    const selected = e.target.files[0];
-    if (selected) {
-      setFile(selected);
-      setError(null);
-    }
-  };
-
-  const handleUpload = async () => {
-    if (!file) return;
+  const handleNocUpload = async () => {
+    if (!nocFile) return;
     setUploading(true);
     setError(null);
-    setResult(null);
+    setNocResult(null);
+    setFpResult(null);
 
     try {
-      const data = await uploadNOC(file);
-      setResult(data);
-      setFile(null);
+      const data = await uploadNOC(nocFile);
+      setNocResult(data);
+      setNocFile(null);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -46,87 +47,193 @@ export default function NOCUpload() {
     }
   };
 
+  const handleFpDrop = (e) => {
+    e.preventDefault();
+    const dropped = e.dataTransfer.files[0];
+    if (dropped?.type === 'application/pdf') {
+      setFpFile(dropped);
+      setFpError(null);
+    } else {
+      setFpError('Only PDF files are accepted');
+    }
+  };
+
+  const handleFpUpload = async () => {
+    if (!fpFile || !nocResult?.building_id) return;
+    setFpUploading(true);
+    setFpError(null);
+
+    try {
+      const data = await uploadFloorplan(nocResult.building_id, fpFile);
+      setFpResult(data);
+      setFpFile(null);
+    } catch (err) {
+      setFpError(err.message);
+    } finally {
+      setFpUploading(false);
+    }
+  };
+
   return (
     <div className="noc-upload">
-      {/* Drop zone */}
-      <div
-        className={`noc-upload__dropzone ${file ? 'noc-upload__dropzone--has-file' : ''}`}
-        onDrop={handleDrop}
-        onDragOver={(e) => e.preventDefault()}
-        onClick={() => inputRef.current?.click()}
-      >
-        <input
-          ref={inputRef}
-          type="file"
-          accept=".pdf"
-          onChange={handleSelect}
-          hidden
-        />
-        {file ? (
-          <div className="noc-upload__file-info">
-            <span className="noc-upload__file-icon">📄</span>
-            <span className="noc-upload__file-name">{file.name}</span>
-            <span className="noc-upload__file-size">
-              {(file.size / 1024 / 1024).toFixed(2)} MB
-            </span>
+      {/* ── Step 1: NOC Document ── */}
+      <div className="noc-upload__step">
+        <div className="noc-upload__step-header">
+          <span className="noc-upload__step-num">1</span>
+          <div>
+            <h3 className="noc-upload__step-title">Upload NOC Document</h3>
+            <p className="noc-upload__step-desc">Upload a Fire NOC PDF — AI will extract all building data automatically</p>
           </div>
-        ) : (
-          <div className="noc-upload__placeholder">
-            <span className="noc-upload__placeholder-icon">📤</span>
-            <span className="noc-upload__placeholder-title">Drop NOC PDF here</span>
-            <span className="noc-upload__placeholder-sub">or click to browse</span>
-          </div>
+        </div>
+
+        <div
+          className={`noc-upload__dropzone ${nocFile ? 'noc-upload__dropzone--has-file' : ''} ${nocResult ? 'noc-upload__dropzone--done' : ''}`}
+          onDrop={handleNocDrop}
+          onDragOver={(e) => e.preventDefault()}
+          onClick={() => !nocResult && nocInputRef.current?.click()}
+        >
+          <input ref={nocInputRef} type="file" accept=".pdf" onChange={(e) => { setNocFile(e.target.files[0]); setError(null); }} hidden />
+          {nocResult ? (
+            <div className="noc-upload__file-info">
+              <span className="noc-upload__file-icon">✅</span>
+              <div>
+                <span className="noc-upload__file-name">{nocResult.building_name}</span>
+                <span className="noc-upload__file-detail">
+                  {nocResult.building_id} · {nocResult.ward} · {nocResult.area_name} · {nocResult.fields_extracted} fields extracted
+                </span>
+              </div>
+            </div>
+          ) : nocFile ? (
+            <div className="noc-upload__file-info">
+              <span className="noc-upload__file-icon">📄</span>
+              <span className="noc-upload__file-name">{nocFile.name}</span>
+              <span className="noc-upload__file-size">{(nocFile.size / 1024 / 1024).toFixed(2)} MB</span>
+            </div>
+          ) : (
+            <div className="noc-upload__placeholder">
+              <span className="noc-upload__placeholder-icon">📤</span>
+              <span className="noc-upload__placeholder-title">Drop NOC PDF here</span>
+              <span className="noc-upload__placeholder-sub">or click to browse</span>
+            </div>
+          )}
+        </div>
+
+        {nocFile && !nocResult && (
+          <button className="noc-upload__button" onClick={handleNocUpload} disabled={uploading}>
+            {uploading ? 'Extracting with AI...' : 'Upload & Extract NOC'}
+          </button>
         )}
+
+        {error && <div className="noc-upload__error">{error}</div>}
       </div>
 
-      {/* Upload button */}
-      {file && (
-        <button
-          className="noc-upload__button"
-          onClick={handleUpload}
-          disabled={uploading}
-        >
-          {uploading ? 'Extracting data...' : 'Upload & Extract'}
-        </button>
-      )}
-
-      {/* Error */}
-      {error && (
-        <div className="noc-upload__error">{error}</div>
-      )}
-
-      {/* Results */}
-      {result && (
-        <div className="noc-upload__result animate-in">
-          <h3 className="noc-upload__result-title">Extraction Complete</h3>
-          <div className="noc-upload__result-stats">
-            <div className="noc-upload__stat">
-              <span className="noc-upload__stat-num">{result.total_extracted}</span>
-              <span className="noc-upload__stat-label">Extracted</span>
-            </div>
-            <div className="noc-upload__stat noc-upload__stat--success">
-              <span className="noc-upload__stat-num">{result.total_saved}</span>
-              <span className="noc-upload__stat-label">New Saved</span>
-            </div>
-            <div className="noc-upload__stat">
-              <span className="noc-upload__stat-num">{result.total_skipped}</span>
-              <span className="noc-upload__stat-label">Already Exist</span>
+      {/* ── Step 2: Floorplan (shown after NOC upload succeeds) ── */}
+      {nocResult && (
+        <div className="noc-upload__step animate-in">
+          <div className="noc-upload__step-header">
+            <span className="noc-upload__step-num">2</span>
+            <div>
+              <h3 className="noc-upload__step-title">Upload Floorplan (Optional)</h3>
+              <p className="noc-upload__step-desc">
+                Upload the building floorplan PDF for {nocResult.building_name} — individual floor plans will be cropped automatically
+              </p>
             </div>
           </div>
 
-          <div className="noc-upload__result-list">
-            {result.buildings.map((b) => (
-              <div key={b.building_id} className="noc-upload__result-item">
-                <span className="noc-upload__result-id">{b.building_id}</span>
-                <span className="noc-upload__result-name">{b.name}</span>
-                {b.is_high_hazard && <StatusBadge type="hazard">HAZARD</StatusBadge>}
-                {result.saved.includes(b.building_id) ? (
-                  <StatusBadge type="valid">NEW</StatusBadge>
+          {!fpResult ? (
+            <>
+              <div
+                className={`noc-upload__dropzone ${fpFile ? 'noc-upload__dropzone--has-file' : ''}`}
+                onDrop={handleFpDrop}
+                onDragOver={(e) => e.preventDefault()}
+                onClick={() => fpInputRef.current?.click()}
+              >
+                <input ref={fpInputRef} type="file" accept=".pdf" onChange={(e) => { setFpFile(e.target.files[0]); setFpError(null); }} hidden />
+                {fpFile ? (
+                  <div className="noc-upload__file-info">
+                    <span className="noc-upload__file-icon">📐</span>
+                    <span className="noc-upload__file-name">{fpFile.name}</span>
+                    <span className="noc-upload__file-size">{(fpFile.size / 1024 / 1024).toFixed(2)} MB</span>
+                  </div>
                 ) : (
-                  <span className="noc-upload__result-skip">exists</span>
+                  <div className="noc-upload__placeholder">
+                    <span className="noc-upload__placeholder-icon">📐</span>
+                    <span className="noc-upload__placeholder-title">Drop Floorplan PDF here</span>
+                    <span className="noc-upload__placeholder-sub">or click to browse · not required</span>
+                  </div>
                 )}
               </div>
-            ))}
+
+              {fpFile && (
+                <button className="noc-upload__button" onClick={handleFpUpload} disabled={fpUploading}>
+                  {fpUploading ? 'Processing floorplans...' : 'Upload & Process Floorplan'}
+                </button>
+              )}
+
+              <button
+                className="noc-upload__skip"
+                onClick={() => { setNocResult(null); setNocFile(null); }}
+              >
+                Skip floorplan — upload another NOC
+              </button>
+            </>
+          ) : (
+            <div className="noc-upload__result animate-in">
+              <h3 className="noc-upload__result-title">✅ Floorplan Processed</h3>
+              <p className="noc-upload__result-msg">{fpResult.message}</p>
+              <div className="noc-upload__fp-list">
+                {fpResult.floor_plans.map((fp) => (
+                  <div key={fp.id} className="noc-upload__fp-item">
+                    <span className="noc-upload__fp-label">{fp.floor_label}</span>
+                    <span className="noc-upload__fp-path">{fp.image_path}</span>
+                  </div>
+                ))}
+              </div>
+              <button
+                className="noc-upload__button noc-upload__button--secondary"
+                onClick={() => { setNocResult(null); setFpResult(null); setNocFile(null); setFpFile(null); }}
+              >
+                Upload Another Building
+              </button>
+            </div>
+          )}
+
+          {fpError && <div className="noc-upload__error">{fpError}</div>}
+        </div>
+      )}
+
+      {/* NOC Result details */}
+      {nocResult && !fpResult && (
+        <div className="noc-upload__result animate-in">
+          <h3 className="noc-upload__result-title">NOC Extraction Complete</h3>
+          <p className="noc-upload__result-msg">{nocResult.message}</p>
+          <div className="noc-upload__result-stats">
+            <div className="noc-upload__stat noc-upload__stat--success">
+              <span className="noc-upload__stat-num">{nocResult.fields_extracted}</span>
+              <span className="noc-upload__stat-label">Fields Extracted</span>
+            </div>
+          </div>
+          <div className="noc-upload__result-detail">
+            <div className="noc-upload__result-row">
+              <span className="noc-upload__result-key">Building ID</span>
+              <span className="noc-upload__result-val">{nocResult.building_id}</span>
+            </div>
+            <div className="noc-upload__result-row">
+              <span className="noc-upload__result-key">Building Name</span>
+              <span className="noc-upload__result-val">{nocResult.building_name}</span>
+            </div>
+            {nocResult.ward && (
+              <div className="noc-upload__result-row">
+                <span className="noc-upload__result-key">Ward</span>
+                <span className="noc-upload__result-val">{nocResult.ward}</span>
+              </div>
+            )}
+            {nocResult.area_name && (
+              <div className="noc-upload__result-row">
+                <span className="noc-upload__result-key">Area</span>
+                <span className="noc-upload__result-val">{nocResult.area_name}</span>
+              </div>
+            )}
           </div>
         </div>
       )}

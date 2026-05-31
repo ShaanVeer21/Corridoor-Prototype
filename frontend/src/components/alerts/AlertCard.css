@@ -73,11 +73,10 @@
   gap: var(--space-2);
   font-size: var(--font-size-xs);
   color: var(--text-tertiary);
+  flex-wrap: wrap;
 }
 
-.alert-card__sep {
-  opacity: 0.4;
-}
+.alert-card__sep { opacity: 0.4; }
 
 .alert-card__id {
   font-family: var(--font-mono);
@@ -85,9 +84,35 @@
   color: var(--brand-primary);
 }
 
-.alert-card__building-type {
-  display: inline-block;
+.alert-card__category {
+  text-transform: capitalize;
+  font-weight: 500;
+}
+
+.alert-card__ward {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.alert-card__floor {
+  color: var(--color-hazard);
+  font-weight: 600;
+}
+
+.alert-card__bottom {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
   margin-top: var(--space-2);
+}
+
+.alert-card__building-type {
   font-size: var(--font-size-xs);
   color: var(--text-secondary);
+}
+
+.alert-card__reporter {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  font-style: italic;
 }

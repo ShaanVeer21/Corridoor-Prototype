@@ -145,7 +145,7 @@ export default function NOCDetail({ building, onClose }) {
           <div className="noc-detail__section animate-in">
             <h3 className="noc-detail__section-title">Building Floorplan</h3>
             <p className="noc-detail__section-desc">Dummy floorplan for prototype — production will use per-building plans from NOC submissions</p>
-            <FloorplanViewer path={building.floorplan_path} />
+            <FloorplanViewer floorPlans={building.floor_plans} path={building.floorplan_path} />
           </div>
         )}
       </div>

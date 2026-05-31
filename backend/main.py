@@ -1,47 +1,71 @@
 """
-Corridoor Backend — FastAPI Application
-All routes for buildings, users, alerts, real-time updates, and WebSocket.
+Corridoor v2 — FastAPI Application
+Complete API with:
+- NOC PDF upload + Gemini extraction
+- Floorplan PDF upload + Gemini Vision cropping
+- Floor-specific plan lookup during incidents
+- Photo uploads in live updates
+- Responder login
+- Incident categories (fire/rescue/collapse/other)
+- WebSocket for real-time alerts
 """
 
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
+import os
+import json
+import shutil
+from pathlib import Path
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from datetime import datetime, date
-from typing import List
+from math import sqrt
+from typing import List, Optional
 
 from database import get_db, init_db
 from models import (
-    Building, FireStation, BuildingStationMap,
+    Building, FloorPlan, FireStation, BuildingStationMap,
     User, FireAlert, RealTimeUpdate,
-    AlertStatus
+    AlertStatus, IncidentCategory
 )
 from schemas import (
     BuildingListItem, BuildingFull, BuildingSectionA, BuildingSectionB, BuildingSectionC,
+    FloorPlanItem,
     UserRegister, UserResponse,
     AlertCreate, AlertResponse, AlertStatusUpdate,
     RealTimeUpdateCreate, RealTimeUpdateResponse,
     FireStationResponse,
+    NOCUploadResponse, FloorplanUploadResponse,
 )
 from ws_manager import manager
+from noc_extractor_v2 import extract_noc_with_gemini, noc_data_to_building_dict
+from floorplan_processor import process_floorplan_pdf, get_floorplan_for_floor, get_all_floorplans
+from geocoder import geocode_address
+
+# Ensure directories exist
+NOC_DATA_DIR = Path("noc_data")
+NOC_DATA_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR = NOC_DATA_DIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+PHOTOS_DIR = NOC_DATA_DIR / "photos"
+PHOTOS_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
-    title="Corridoor API",
-    description="Fire incident response system — Thane Municipal Corporation prototype",
-    version="1.0.0",
+    title="Corridoor API v2",
+    description="Fire incident response system — real NOC extraction + floorplan processing",
+    version="2.0.0",
 )
 
-# ── CORS — allow frontend and mobile to connect ──
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Serve static files (floorplans, logo) ──
+# Serve static files (floorplans, photos, logo)
 app.mount("/static", StaticFiles(directory="noc_data"), name="static")
 
 
@@ -51,52 +75,84 @@ async def startup():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HEALTH
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "version": "2.0.0"}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # BUILDINGS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.get("/api/buildings", response_model=List[BuildingListItem])
 async def list_buildings(db: AsyncSession = Depends(get_db)):
-    """
-    Returns all buildings for the searchable dropdown.
-    Label format: "THN-004 · Hiranandani Estate — Tower A & B · Patlipada, Ghodbunder Road, Thane West"
-    """
-    result = await db.execute(select(Building))
+    result = await db.execute(select(Building).order_by(Building.building_id))
     buildings = result.scalars().all()
     items = []
     for b in buildings:
-        # Build the full dropdown label
-        short_address = b.address.split("–")[0].strip() if "–" in b.address else b.address
-        label = f"{b.building_id} · {b.name} · {short_address}"
+        area = b.area_name or ""
+        ward = b.ward or ""
+        label = f"{b.building_id} · {b.name}"
+        if area:
+            label += f" · {area}"
+        if ward:
+            label += f" · {ward}"
         items.append(BuildingListItem(
             building_id=b.building_id,
             name=b.name,
             building_type=b.building_type,
             address=b.address,
+            ward=b.ward,
+            area_name=b.area_name,
             is_high_hazard=b.is_high_hazard,
             noc_valid_till=b.noc_valid_till,
+            floors_above_ground=b.floors_above_ground,
+            floors_below_ground=b.floors_below_ground,
+            total_height_metres=b.total_height_metres,
+            daytime_occupancy=b.daytime_occupancy,
+            latitude=b.latitude,
+            longitude=b.longitude,
             label=label,
         ))
     return items
 
 
-@app.get("/api/buildings/{building_id}", response_model=BuildingFull)
+@app.get("/api/buildings/{building_id:path}", response_model=BuildingFull)
 async def get_building(building_id: str, db: AsyncSession = Depends(get_db)):
-    """Returns full NOC data for a building — the incident packet."""
     result = await db.execute(select(Building).where(Building.building_id == building_id))
     b = result.scalar_one_or_none()
     if not b:
-        raise HTTPException(status_code=404, detail="Building not found")
+        raise HTTPException(404, f"Building {building_id} not found")
+
+    # Get floor plans
+    fp_result = await db.execute(
+        select(FloorPlan).where(FloorPlan.building_id == building_id).order_by(FloorPlan.id)
+    )
+    floor_plans = [FloorPlanItem(
+        id=fp.id, floor_label=fp.floor_label, floor_numbers=fp.floor_numbers,
+        image_path=fp.image_path, page_number=fp.page_number
+    ) for fp in fp_result.scalars().all()]
 
     return BuildingFull(
         building_id=b.building_id,
         name=b.name,
+        name_mr=b.name_mr,
+        name_hi=b.name_hi,
         building_type=b.building_type,
+        ward=b.ward,
+        area_name=b.area_name,
+        file_number=b.file_number,
         noc_number=b.noc_number,
         noc_valid_till=b.noc_valid_till,
+        noc_type=b.noc_type,
         is_high_hazard=b.is_high_hazard,
-        floorplan_path=b.floorplan_path,
         latitude=b.latitude,
         longitude=b.longitude,
+        floor_wise_usage=b.floor_wise_usage,
+        floor_plans=floor_plans,
         section_a=BuildingSectionA(
             address=b.address,
             nearest_landmark=b.nearest_landmark,
@@ -142,206 +198,265 @@ async def get_building(building_id: str, db: AsyncSession = Depends(get_db)):
             last_inspection_date=b.last_inspection_date,
             inspecting_officer=b.inspecting_officer,
         ),
+        ug_tank_capacity_litres=b.ug_tank_capacity_litres,
+        oh_tank_capacity_litres=b.oh_tank_capacity_litres,
+        road_width_metres=b.road_width_metres,
+        developer_name=b.developer_name,
+        licensed_surveyor=b.licensed_surveyor,
+        smoke_detection=b.smoke_detection,
+        water_spray_system=b.water_spray_system,
+        car_parking_details=b.car_parking_details,
+        div_fire_officer=b.div_fire_officer,
+        chief_fire_officer=b.chief_fire_officer,
     )
 
 
-@app.get("/api/buildings/{building_id}/station", response_model=FireStationResponse)
+@app.get("/api/buildings/{building_id:path}/station", response_model=FireStationResponse)
 async def get_nearest_station(building_id: str, db: AsyncSession = Depends(get_db)):
-    """Returns the nearest fire station for a building (for the 'Call' button)."""
     result = await db.execute(
         select(BuildingStationMap).where(BuildingStationMap.building_id == building_id)
     )
     mapping = result.scalar_one_or_none()
     if not mapping:
-        raise HTTPException(status_code=404, detail="No station mapped for this building")
-
-    station_result = await db.execute(
-        select(FireStation).where(FireStation.id == mapping.fire_station_id)
-    )
-    station = station_result.scalar_one_or_none()
+        # Return first station as fallback
+        result = await db.execute(select(FireStation).limit(1))
+        station = result.scalar_one_or_none()
+        if not station:
+            raise HTTPException(404, "No fire stations found")
+        return station
+    
+    result = await db.execute(select(FireStation).where(FireStation.id == mapping.fire_station_id))
+    station = result.scalar_one_or_none()
     if not station:
-        raise HTTPException(status_code=404, detail="Fire station not found")
-
-    return FireStationResponse(
-        id=station.id,
-        name=station.name,
-        address=station.address,
-        latitude=station.latitude,
-        longitude=station.longitude,
-        phone=station.phone,
-    )
+        raise HTTPException(404, "Fire station not found")
+    return station
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FLOOR PLANS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.get("/api/buildings/{building_id:path}/floorplans", response_model=List[FloorPlanItem])
+async def get_floor_plans(building_id: str, db: AsyncSession = Depends(get_db)):
+    """Get all floor plans for a building."""
+    result = await db.execute(
+        select(FloorPlan).where(FloorPlan.building_id == building_id).order_by(FloorPlan.id)
+    )
+    return result.scalars().all()
+
+
+@app.get("/api/buildings/{building_id:path}/floorplans/floor/{floor_number}")
+async def get_floor_plan_for_floor(building_id: str, floor_number: int, db: AsyncSession = Depends(get_db)):
+    """
+    Get the specific floor plan that covers a given floor number.
+    Used during incidents when staff reports fire on a specific floor.
+    """
+    result = await db.execute(
+        select(FloorPlan).where(FloorPlan.building_id == building_id)
+    )
+    plans = result.scalars().all()
+    
+    if not plans:
+        raise HTTPException(404, "No floor plans found for this building")
+    
+    # Convert to dicts for the matcher
+    plan_dicts = [
+        {"id": p.id, "floor_label": p.floor_label, 
+         "floor_numbers": json.loads(p.floor_numbers) if p.floor_numbers else [],
+         "image_path": p.image_path, "page_number": p.page_number}
+        for p in plans
+    ]
+    
+    matched = get_floorplan_for_floor(plan_dicts, floor_number)
+    if not matched:
+        # Return all plans if no match
+        return {"matched": False, "floor_plans": plan_dicts}
+    
+    return {"matched": True, "floor_plan": matched, "all_floor_plans": plan_dicts}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FIRE STATIONS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.get("/api/stations", response_model=List[FireStationResponse])
 async def list_stations(db: AsyncSession = Depends(get_db)):
-    """List all fire stations."""
     result = await db.execute(select(FireStation))
-    stations = result.scalars().all()
-    return [FireStationResponse(
-        id=s.id, name=s.name, address=s.address,
-        latitude=s.latitude, longitude=s.longitude, phone=s.phone
-    ) for s in stations]
+    return result.scalars().all()
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# USERS (Staff/Security registration)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# USERS (Staff + Responders)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.post("/api/users", response_model=UserResponse)
-async def register_user(user: UserRegister, db: AsyncSession = Depends(get_db)):
-    """Register a staff/security user. No password for prototype."""
-    # Verify building exists
-    building = await db.execute(select(Building).where(Building.building_id == user.building_id))
-    if not building.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Building not found")
-
-    new_user = User(
-        name=user.name,
-        role=user.role,
-        building_id=user.building_id,
-        registered_at=datetime.utcnow(),
+async def register_user(data: UserRegister, db: AsyncSession = Depends(get_db)):
+    user = User(
+        name=data.name,
+        role=data.role,
+        phone=data.phone,
+        building_id=data.building_id,
+        is_responder=data.is_responder,
+        station_id=data.station_id,
+        badge_number=data.badge_number,
+        rank=data.rank,
     )
-    db.add(new_user)
+    db.add(user)
     await db.commit()
-    await db.refresh(new_user)
-    return UserResponse(
-        id=new_user.id,
-        name=new_user.name,
-        role=new_user.role,
-        building_id=new_user.building_id,
-        registered_at=new_user.registered_at,
+    await db.refresh(user)
+    return user
+
+
+@app.post("/api/responder/login", response_model=UserResponse)
+async def responder_login(data: UserRegister, db: AsyncSession = Depends(get_db)):
+    """
+    Fire responder login. Creates or finds existing responder.
+    No password for prototype.
+    """
+    # Check if responder already exists by badge number
+    if data.badge_number:
+        result = await db.execute(
+            select(User).where(User.badge_number == data.badge_number, User.is_responder == True)
+        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            return existing
+    
+    # Create new responder
+    user = User(
+        name=data.name,
+        role=data.rank or data.role or "Fire Responder",
+        phone=data.phone,
+        is_responder=True,
+        station_id=data.station_id,
+        badge_number=data.badge_number,
+        rank=data.rank,
     )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
 
 
-@app.get("/api/users/{user_id}", response_model=UserResponse)
-async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
-    """Get user details."""
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return UserResponse(
-        id=user.id, name=user.name, role=user.role,
-        building_id=user.building_id, registered_at=user.registered_at,
-    )
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FIRE ALERTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.post("/api/alerts", response_model=AlertResponse)
-async def create_alert(alert: AlertCreate, db: AsyncSession = Depends(get_db)):
-    """
-    Triggered when staff hits 'Send fire alert'.
-    Creates the alert AND broadcasts it to the nearest fire station dashboard via WebSocket.
-    """
-    # Verify building exists
-    building_result = await db.execute(select(Building).where(Building.building_id == alert.building_id))
-    building = building_result.scalar_one_or_none()
+async def create_alert(data: AlertCreate, db: AsyncSession = Depends(get_db)):
+    # Validate building exists
+    result = await db.execute(select(Building).where(Building.building_id == data.building_id))
+    building = result.scalar_one_or_none()
     if not building:
-        raise HTTPException(status_code=404, detail="Building not found")
+        raise HTTPException(404, f"Building {data.building_id} not found")
 
-    new_alert = FireAlert(
-        building_id=alert.building_id,
-        reported_by=alert.reported_by,
-        created_at=datetime.utcnow(),
-        status=AlertStatus.ACTIVE.value,
-        alert_type=alert.alert_type,
+    # Get reporter info
+    result = await db.execute(select(User).where(User.id == data.reported_by))
+    reporter = result.scalar_one_or_none()
+
+    alert = FireAlert(
+        building_id=data.building_id,
+        reported_by=data.reported_by,
+        incident_category=data.incident_category,
+        alert_type=data.alert_type,
+        floor=data.floor,
+        floor_number=data.floor_number,
     )
-    db.add(new_alert)
+    db.add(alert)
     await db.commit()
-    await db.refresh(new_alert)
+    await db.refresh(alert)
 
-    # Find the nearest fire station for WebSocket broadcast
-    mapping_result = await db.execute(
-        select(BuildingStationMap).where(BuildingStationMap.building_id == alert.building_id)
-    )
-    mapping = mapping_result.scalar_one_or_none()
+    # Build response with joined data
+    response_data = {
+        "id": alert.id,
+        "building_id": alert.building_id,
+        "reported_by": alert.reported_by,
+        "created_at": alert.created_at.isoformat(),
+        "status": alert.status,
+        "incident_category": alert.incident_category,
+        "alert_type": alert.alert_type,
+        "floor": alert.floor,
+        "floor_number": alert.floor_number,
+        "building_name": building.name,
+        "building_type": building.building_type,
+        "is_high_hazard": building.is_high_hazard,
+        "ward": building.ward,
+        "area_name": building.area_name,
+        "reporter_name": reporter.name if reporter else None,
+        "reporter_role": reporter.role if reporter else None,
+        "reporter_phone": reporter.phone if reporter else None,
+    }
 
-    if mapping:
-        await manager.broadcast_new_alert(mapping.fire_station_id, {
-            "alert_id": new_alert.id,
-            "building_id": building.building_id,
-            "building_name": building.name,
-            "building_type": building.building_type,
-            "is_high_hazard": building.is_high_hazard,
-            "alert_type": new_alert.alert_type,
-            "created_at": new_alert.created_at.isoformat(),
-            "status": new_alert.status,
-        })
+    # Broadcast to all stations via WebSocket
+    await manager.broadcast_to_all_stations({
+        "type": "NEW_ALERT",
+        "data": response_data,
+    })
 
-    return AlertResponse(
-        id=new_alert.id,
-        building_id=new_alert.building_id,
-        reported_by=new_alert.reported_by,
-        created_at=new_alert.created_at,
-        status=new_alert.status,
-        alert_type=new_alert.alert_type,
-        building_name=building.name,
-        building_type=building.building_type,
-        is_high_hazard=building.is_high_hazard,
-    )
+    return AlertResponse(**response_data)
 
 
 @app.get("/api/alerts", response_model=List[AlertResponse])
 async def list_alerts(
-    status: str = None,
-    station_id: int = None,
+    status: Optional[str] = None,
+    station_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    List alerts. Optionally filter by status and/or station.
-    station_id filters to only buildings mapped to that station.
-    """
-    query = select(FireAlert, Building).join(Building, FireAlert.building_id == Building.building_id)
-
+    query = select(FireAlert).order_by(FireAlert.created_at.desc())
     if status:
         query = query.where(FireAlert.status == status)
 
-    if station_id:
-        # Subquery: building IDs mapped to this station
-        subq = select(BuildingStationMap.building_id).where(
-            BuildingStationMap.fire_station_id == station_id
-        )
-        query = query.where(FireAlert.building_id.in_(subq))
-
-    query = query.order_by(FireAlert.created_at.desc())
     result = await db.execute(query)
-    rows = result.all()
+    alerts = result.scalars().all()
 
-    return [AlertResponse(
-        id=alert.id,
-        building_id=alert.building_id,
-        reported_by=alert.reported_by,
-        created_at=alert.created_at,
-        status=alert.status,
-        alert_type=alert.alert_type,
-        building_name=building.name,
-        building_type=building.building_type,
-        is_high_hazard=building.is_high_hazard,
-    ) for alert, building in rows]
+    items = []
+    for a in alerts:
+        # Get building info
+        b_result = await db.execute(select(Building).where(Building.building_id == a.building_id))
+        building = b_result.scalar_one_or_none()
+        # Get reporter info
+        r_result = await db.execute(select(User).where(User.id == a.reported_by))
+        reporter = r_result.scalar_one_or_none()
+
+        items.append(AlertResponse(
+            id=a.id,
+            building_id=a.building_id,
+            reported_by=a.reported_by,
+            created_at=a.created_at,
+            status=a.status,
+            incident_category=a.incident_category,
+            alert_type=a.alert_type,
+            floor=a.floor,
+            floor_number=a.floor_number,
+            building_name=building.name if building else None,
+            building_type=building.building_type if building else None,
+            is_high_hazard=building.is_high_hazard if building else None,
+            ward=building.ward if building else None,
+            area_name=building.area_name if building else None,
+            reporter_name=reporter.name if reporter else None,
+            reporter_role=reporter.role if reporter else None,
+            reporter_phone=reporter.phone if reporter else None,
+        ))
+
+    return items
 
 
 @app.patch("/api/alerts/{alert_id}", response_model=AlertResponse)
-async def update_alert_status(alert_id: int, body: AlertStatusUpdate, db: AsyncSession = Depends(get_db)):
-    """Acknowledge or resolve an alert."""
+async def update_alert_status(alert_id: int, data: AlertStatusUpdate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(FireAlert).where(FireAlert.id == alert_id))
     alert = result.scalar_one_or_none()
     if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
+        raise HTTPException(404, "Alert not found")
 
-    alert.status = body.status
+    alert.status = data.status
     await db.commit()
     await db.refresh(alert)
 
-    # Get building info for response
-    building_result = await db.execute(select(Building).where(Building.building_id == alert.building_id))
-    building = building_result.scalar_one_or_none()
+    # Get building and reporter
+    b_result = await db.execute(select(Building).where(Building.building_id == alert.building_id))
+    building = b_result.scalar_one_or_none()
+    r_result = await db.execute(select(User).where(User.id == alert.reported_by))
+    reporter = r_result.scalar_one_or_none()
 
     return AlertResponse(
         id=alert.id,
@@ -349,339 +464,426 @@ async def update_alert_status(alert_id: int, body: AlertStatusUpdate, db: AsyncS
         reported_by=alert.reported_by,
         created_at=alert.created_at,
         status=alert.status,
+        incident_category=alert.incident_category,
         alert_type=alert.alert_type,
+        floor=alert.floor,
+        floor_number=alert.floor_number,
         building_name=building.name if building else None,
         building_type=building.building_type if building else None,
         is_high_hazard=building.is_high_hazard if building else None,
+        ward=building.ward if building else None,
+        area_name=building.area_name if building else None,
+        reporter_name=reporter.name if reporter else None,
+        reporter_role=reporter.role if reporter else None,
+        reporter_phone=reporter.phone if reporter else None,
     )
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# REAL-TIME UPDATES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# REAL-TIME UPDATES (with photo upload)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.post("/api/updates", response_model=RealTimeUpdateResponse)
-async def create_update(upd: RealTimeUpdateCreate, db: AsyncSession = Depends(get_db)):
-    """
-    Staff sends a real-time update during an active incident.
-    This gets pushed to the fire station dashboard via WebSocket.
-    """
-    # Verify alert exists and is active
-    alert_result = await db.execute(select(FireAlert).where(FireAlert.id == upd.alert_id))
-    alert = alert_result.scalar_one_or_none()
-    if not alert:
-        raise HTTPException(status_code=404, detail="Alert not found")
-
-    new_update = RealTimeUpdate(
-        alert_id=upd.alert_id,
-        sent_by=upd.sent_by,
-        floor_number=upd.floor_number,
-        affected_area=upd.affected_area,
-        estimated_occupants=upd.estimated_occupants,
-        message=upd.message,
-        sent_at=datetime.utcnow(),
+async def send_update(data: RealTimeUpdateCreate, db: AsyncSession = Depends(get_db)):
+    """Send a text-only update."""
+    update_obj = RealTimeUpdate(
+        alert_id=data.alert_id,
+        sent_by=data.sent_by,
+        floor_number=data.floor_number,
+        affected_area=data.affected_area,
+        estimated_occupants=data.estimated_occupants,
+        message=data.message,
     )
-    db.add(new_update)
+    db.add(update_obj)
     await db.commit()
-    await db.refresh(new_update)
+    await db.refresh(update_obj)
 
     # Get sender name
-    sender_result = await db.execute(select(User).where(User.id == upd.sent_by))
+    sender_result = await db.execute(select(User).where(User.id == data.sent_by))
     sender = sender_result.scalar_one_or_none()
 
-    # Find the station to broadcast to
-    mapping_result = await db.execute(
-        select(BuildingStationMap).where(BuildingStationMap.building_id == alert.building_id)
-    )
-    mapping = mapping_result.scalar_one_or_none()
-
-    update_data = {
-        "id": new_update.id,
-        "alert_id": new_update.alert_id,
-        "sent_by": new_update.sent_by,
-        "sender_name": sender.name if sender else "Unknown",
-        "floor_number": new_update.floor_number,
-        "affected_area": new_update.affected_area,
-        "estimated_occupants": new_update.estimated_occupants,
-        "message": new_update.message,
-        "sent_at": new_update.sent_at.isoformat(),
+    response_data = {
+        "id": update_obj.id,
+        "alert_id": update_obj.alert_id,
+        "sent_by": update_obj.sent_by,
+        "floor_number": update_obj.floor_number,
+        "affected_area": update_obj.affected_area,
+        "estimated_occupants": update_obj.estimated_occupants,
+        "message": update_obj.message,
+        "photo_url": None,
+        "sent_at": update_obj.sent_at.isoformat(),
+        "sender_name": sender.name if sender else None,
     }
 
-    if mapping:
-        await manager.broadcast_update(mapping.fire_station_id, upd.alert_id, update_data)
+    # Broadcast via WebSocket
+    await manager.broadcast_to_alert(data.alert_id, {
+        "type": "REAL_TIME_UPDATE",
+        "data": response_data,
+    })
+    await manager.broadcast_to_all_stations({
+        "type": "REAL_TIME_UPDATE",
+        "data": response_data,
+    })
 
-    return RealTimeUpdateResponse(
-        id=new_update.id,
-        alert_id=new_update.alert_id,
-        sent_by=new_update.sent_by,
-        floor_number=new_update.floor_number,
-        affected_area=new_update.affected_area,
-        estimated_occupants=new_update.estimated_occupants,
-        message=new_update.message,
-        sent_at=new_update.sent_at,
-        sender_name=sender.name if sender else None,
+    return RealTimeUpdateResponse(**response_data)
+
+
+@app.post("/api/updates/with-photo", response_model=RealTimeUpdateResponse)
+async def send_update_with_photo(
+    alert_id: int = Form(...),
+    sent_by: int = Form(...),
+    message: Optional[str] = Form(None),
+    floor_number: Optional[int] = Form(None),
+    affected_area: Optional[str] = Form(None),
+    estimated_occupants: Optional[int] = Form(None),
+    photo: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send an update with a photo attachment."""
+    # Save photo
+    photo_filename = f"alert_{alert_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{photo.filename}"
+    photo_path = PHOTOS_DIR / photo_filename
+    with open(photo_path, "wb") as f:
+        content = await photo.read()
+        f.write(content)
+    
+    relative_photo_path = f"photos/{photo_filename}"
+
+    update_obj = RealTimeUpdate(
+        alert_id=alert_id,
+        sent_by=sent_by,
+        floor_number=floor_number,
+        affected_area=affected_area,
+        estimated_occupants=estimated_occupants,
+        message=message,
+        photo_path=relative_photo_path,
     )
+    db.add(update_obj)
+    await db.commit()
+    await db.refresh(update_obj)
+
+    sender_result = await db.execute(select(User).where(User.id == sent_by))
+    sender = sender_result.scalar_one_or_none()
+
+    photo_url = f"/static/{relative_photo_path}"
+
+    response_data = {
+        "id": update_obj.id,
+        "alert_id": update_obj.alert_id,
+        "sent_by": update_obj.sent_by,
+        "floor_number": update_obj.floor_number,
+        "affected_area": update_obj.affected_area,
+        "estimated_occupants": update_obj.estimated_occupants,
+        "message": update_obj.message,
+        "photo_url": photo_url,
+        "sent_at": update_obj.sent_at.isoformat(),
+        "sender_name": sender.name if sender else None,
+    }
+
+    await manager.broadcast_to_alert(alert_id, {"type": "REAL_TIME_UPDATE", "data": response_data})
+    await manager.broadcast_to_all_stations({"type": "REAL_TIME_UPDATE", "data": response_data})
+
+    return RealTimeUpdateResponse(**response_data)
 
 
 @app.get("/api/updates/{alert_id}", response_model=List[RealTimeUpdateResponse])
 async def get_updates(alert_id: int, db: AsyncSession = Depends(get_db)):
-    """Get all real-time updates for an alert."""
     result = await db.execute(
-        select(RealTimeUpdate, User)
-        .join(User, RealTimeUpdate.sent_by == User.id, isouter=True)
-        .where(RealTimeUpdate.alert_id == alert_id)
-        .order_by(RealTimeUpdate.sent_at.asc())
+        select(RealTimeUpdate).where(RealTimeUpdate.alert_id == alert_id).order_by(RealTimeUpdate.sent_at)
     )
-    rows = result.all()
-    return [RealTimeUpdateResponse(
-        id=upd.id,
-        alert_id=upd.alert_id,
-        sent_by=upd.sent_by,
-        floor_number=upd.floor_number,
-        affected_area=upd.affected_area,
-        estimated_occupants=upd.estimated_occupants,
-        message=upd.message,
-        sent_at=upd.sent_at,
-        sender_name=user.name if user else None,
-    ) for upd, user in rows]
+    updates = result.scalars().all()
+
+    items = []
+    for u in updates:
+        sender_result = await db.execute(select(User).where(User.id == u.sent_by))
+        sender = sender_result.scalar_one_or_none()
+        
+        photo_url = f"/static/{u.photo_path}" if u.photo_path else None
+
+        items.append(RealTimeUpdateResponse(
+            id=u.id,
+            alert_id=u.alert_id,
+            sent_by=u.sent_by,
+            floor_number=u.floor_number,
+            affected_area=u.affected_area,
+            estimated_occupants=u.estimated_occupants,
+            message=u.message,
+            photo_url=photo_url,
+            sent_at=u.sent_at,
+            sender_name=sender.name if sender else None,
+        ))
+    return items
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# WEBSOCKET ENDPOINTS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@app.websocket("/ws/station/{station_id}")
-async def ws_station(websocket: WebSocket, station_id: int):
-    """
-    Fire station dashboard connects here.
-    Receives all alerts and updates for buildings mapped to this station.
-    """
-    await manager.connect(websocket, station_id)
-    try:
-        while True:
-            # Keep connection alive — client can send pings
-            data = await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, station_id)
-
-
-@app.websocket("/ws/alert/{alert_id}")
-async def ws_alert(websocket: WebSocket, alert_id: int):
-    """
-    Subscribe to real-time updates for a specific alert.
-    Used when the dashboard opens a specific incident detail view.
-    """
-    await manager.connect_alert(websocket, alert_id)
-    try:
-        while True:
-            data = await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect_alert(websocket, alert_id)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NOC PDF UPLOAD & EXTRACTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOC UPLOAD + EXTRACTION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@app.post("/api/noc/upload")
-async def upload_noc_pdf(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+@app.post("/api/noc/upload", response_model=NOCUploadResponse)
+async def upload_noc(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """
-    Upload a Fire NOC PDF. The system extracts all building data
-    and saves each building to the database.
-
-    Supports single-building and multi-building NOC PDFs.
-    Returns the list of extracted and saved buildings.
+    Upload a NOC PDF → extract with Gemini → save to database.
     """
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+        raise HTTPException(400, "Only PDF files are accepted")
 
-    pdf_bytes = await file.read()
+    # Save uploaded file
+    upload_path = UPLOADS_DIR / f"noc_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    with open(upload_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
 
-    # Extract buildings from the PDF
-    from noc_extractor import extract_from_pdf
     try:
-        extracted = extract_from_pdf(pdf_bytes=pdf_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to extract data from PDF: {str(e)}")
+        # Extract with Gemini
+        extracted = await extract_noc_with_gemini(str(upload_path))
+        building_data = noc_data_to_building_dict(extracted)
+        building_data["noc_pdf_path"] = str(upload_path.relative_to(Path(".")))
 
-    if not extracted:
-        raise HTTPException(status_code=422, detail="No building data found in the uploaded PDF")
+        # Geocode the address to get lat/lng
+        try:
+            coords = await geocode_address(
+                building_data.get("address", ""),
+                building_data.get("area_name"),
+            )
+            building_data["latitude"] = coords["latitude"]
+            building_data["longitude"] = coords["longitude"]
+        except Exception as e:
+            print(f"Geocoding failed: {e}")
 
-    saved = []
-    skipped = []
-
-    for bdata in extracted:
         # Check if building already exists
-        existing = await db.execute(
-            select(Building).where(Building.building_id == bdata["building_id"])
+        result = await db.execute(
+            select(Building).where(Building.building_id == building_data["building_id"])
         )
-        if existing.scalar_one_or_none():
-            skipped.append(bdata["building_id"])
-            continue
+        existing = result.scalar_one_or_none()
 
-        # Set default floorplan path
-        bdata["floorplan_path"] = "noc_data/floorplan.svg"
+        if existing:
+            # Update existing building with new NOC data
+            for key, value in building_data.items():
+                if value is not None and hasattr(existing, key):
+                    setattr(existing, key, value)
+            existing.updated_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(existing)
+            message = f"Building {building_data['building_id']} created from NOC"
 
-        building = Building(**bdata)
-        db.add(building)
-        saved.append(bdata["building_id"])
+        # Auto-assign nearest fire station
+        try:
+            bid = building_data["building_id"]
+            blat = building_data.get("latitude", 0)
+            blng = building_data.get("longitude", 0)
+            
+            # Check if mapping already exists
+            existing_map = await db.execute(
+                select(BuildingStationMap).where(BuildingStationMap.building_id == bid)
+            )
+            if not existing_map.scalar_one_or_none():
+                # Find nearest station by distance
+                stations_result = await db.execute(select(FireStation))
+                all_stations = stations_result.scalars().all()
+                if all_stations:
+                    if blat != 0 and blng != 0:
+                        nearest = min(all_stations, key=lambda s: sqrt((s.latitude - blat)**2 + (s.longitude - blng)**2))
+                    else:
+                        nearest = all_stations[0]
+                    mapping = BuildingStationMap(building_id=bid, fire_station_id=nearest.id)
+                    db.add(mapping)
+                    await db.commit()
+        except Exception as e:
+            print(f"Auto station mapping failed: {e}")
 
-    if saved:
-        await db.commit()
+        # Count non-null extracted fields
+        else:
+            # Create new building
+            # Remove keys that aren't model fields
+            model_fields = {c.name for c in Building.__table__.columns}
+            filtered_data = {k: v for k, v in building_data.items() if k in model_fields}
+            
+            building = Building(**filtered_data)
+            db.add(building)
+            await db.commit()
+            await db.refresh(building)
+            message = f"Building {building_data['building_id']} created from NOC"
 
-    return {
-        "message": f"Processed {len(extracted)} buildings from PDF",
-        "saved": saved,
-        "skipped_existing": skipped,
-        "total_extracted": len(extracted),
-        "total_saved": len(saved),
-        "total_skipped": len(skipped),
-        "buildings": [
-            {
-                "building_id": b["building_id"],
-                "name": b["name"],
-                "building_type": b["building_type"],
-                "is_high_hazard": b["is_high_hazard"],
-                "noc_number": b["noc_number"],
-                "noc_valid_till": str(b["noc_valid_till"]),
-            }
-            for b in extracted
-        ],
-    }
+        # Count non-null extracted fields
+        fields_extracted = sum(1 for v in extracted.values() if v is not None)
 
+        return NOCUploadResponse(
+            success=True,
+            building_id=building_data["building_id"],
+            building_name=building_data["name"],
+            ward=building_data.get("ward"),
+            area_name=building_data.get("area_name"),
+            fields_extracted=fields_extracted,
+            message=message,
+        )
 
-@app.post("/api/noc/upload/{building_id}")
-async def upload_noc_for_building(
+    except Exception as e:
+        raise HTTPException(500, f"NOC extraction failed: {str(e)}")
+
+@app.get("/api/noc/pdf/{building_id:path}")
+async def get_noc_pdf(building_id: str, db: AsyncSession = Depends(get_db)):
+    """Serve the original NOC PDF file for viewing."""
+    result = await db.execute(select(Building).where(Building.building_id == building_id))
+    building = result.scalar_one_or_none()
+    if not building or not building.noc_pdf_path:
+        raise HTTPException(404, "NOC PDF not found")
+    
+    pdf_path = Path(building.noc_pdf_path)
+    if not pdf_path.exists():
+        raise HTTPException(404, "NOC PDF file missing from disk")
+    
+    from fastapi.responses import FileResponse
+    return FileResponse(str(pdf_path), media_type="application/pdf", filename=f"NOC_{building_id.replace('/', '_')}.pdf")
+
+@app.post("/api/noc/upload/{building_id:path}/floorplan", response_model=FloorplanUploadResponse)
+async def upload_floorplan(
     building_id: str,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Upload/update NOC PDF for a specific existing building.
-    Extracts data and updates the building record.
+    Upload a floorplan PDF for a specific building.
+    Processes with Gemini Vision to identify and crop individual floor plans.
     """
     if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+        raise HTTPException(400, "Only PDF files are accepted")
 
-    # Check building exists
+    # Verify building exists
     result = await db.execute(select(Building).where(Building.building_id == building_id))
     building = result.scalar_one_or_none()
     if not building:
-        raise HTTPException(status_code=404, detail="Building not found")
+        raise HTTPException(404, f"Building {building_id} not found. Upload the NOC document first.")
 
-    pdf_bytes = await file.read()
+    # Save uploaded file
+    safe_id = building_id.replace("/", "_").replace(" ", "_")
+    upload_path = UPLOADS_DIR / f"floorplan_{safe_id}_{file.filename}"
+    with open(upload_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
 
-    from noc_extractor import extract_from_pdf
+    # Update building record
+    building.floorplan_pdf_path = str(upload_path.relative_to(Path(".")))
+    
     try:
-        extracted = extract_from_pdf(pdf_bytes=pdf_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Failed to extract data from PDF: {str(e)}")
+        # Process with Gemini Vision
+        floor_plans = await process_floorplan_pdf(str(upload_path), building_id)
 
-    # Find the matching building in extracted data
-    matching = None
-    for b in extracted:
-        if b["building_id"] == building_id:
-            matching = b
-            break
+        # Delete existing floor plans for this building
+        await db.execute(delete(FloorPlan).where(FloorPlan.building_id == building_id))
 
-    if not matching:
-        # If only one building extracted, assume it's for this building_id
-        if len(extracted) == 1:
-            matching = extracted[0]
-            matching["building_id"] = building_id
-        else:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Building {building_id} not found in the uploaded PDF"
+        # Save new floor plans
+        db_plans = []
+        for plan in floor_plans:
+            fp = FloorPlan(
+                building_id=building_id,
+                floor_label=plan["floor_label"],
+                floor_numbers=json.dumps(plan["floor_numbers"]),
+                image_path=plan["image_path"],
+                page_number=plan["page_number"],
             )
+            db.add(fp)
+            db_plans.append(fp)
 
-    # Update the building record with extracted data
-    skip_fields = {"building_id", "floorplan_path", "latitude", "longitude"}
-    for key, value in matching.items():
-        if key not in skip_fields and value is not None:
-            setattr(building, key, value)
+        await db.commit()
 
-    await db.commit()
-    await db.refresh(building)
+        # Refresh to get IDs
+        plan_items = []
+        for fp in db_plans:
+            await db.refresh(fp)
+            plan_items.append(FloorPlanItem(
+                id=fp.id, floor_label=fp.floor_label, floor_numbers=fp.floor_numbers,
+                image_path=fp.image_path, page_number=fp.page_number,
+            ))
 
-    return {
-        "message": f"Updated NOC data for {building_id}",
-        "building_id": building_id,
-        "name": building.name,
-        "noc_number": building.noc_number,
-        "noc_valid_till": str(building.noc_valid_till),
-    }
+        return FloorplanUploadResponse(
+            success=True,
+            building_id=building_id,
+            floor_plans_extracted=len(plan_items),
+            floor_plans=plan_items,
+            message=f"Extracted {len(plan_items)} floor plans from {file.filename}",
+        )
 
+    except Exception as e:
+        raise HTTPException(500, f"Floorplan processing failed: {str(e)}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# NOC SEARCH
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.get("/api/noc/search")
-async def search_buildings(
-    q: str = "",
+async def search_noc(
+    q: Optional[str] = None,
     hazard_only: bool = False,
     expired_only: bool = False,
-    building_type: str = None,
-    db: AsyncSession = Depends(get_db)
+    ward: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Search and filter buildings by name, type, hazard status, or NOC expiry.
-    Used by the fire station dashboard to browse the NOC database.
-    """
-    from datetime import date as date_type
-
     query = select(Building)
+
+    if q:
+        search = f"%{q}%"
+        query = query.where(
+            Building.building_id.ilike(search) |
+            Building.name.ilike(search) |
+            Building.address.ilike(search) |
+            Building.building_type.ilike(search) |
+            Building.area_name.ilike(search) |
+            Building.ward.ilike(search) |
+            Building.file_number.ilike(search)
+        )
 
     if hazard_only:
         query = query.where(Building.is_high_hazard == True)
+    
+    if ward:
+        query = query.where(Building.ward.ilike(f"%{ward}%"))
 
-    if expired_only:
-        query = query.where(Building.noc_valid_till < date_type.today())
-
-    if building_type:
-        query = query.where(Building.building_type.ilike(f"%{building_type}%"))
-
-    result = await db.execute(query)
+    result = await db.execute(query.order_by(Building.building_id))
     buildings = result.scalars().all()
 
-    # Apply text search filter (name, address, building_id)
-    if q:
-        q_lower = q.lower()
-        buildings = [
-            b for b in buildings
-            if q_lower in b.building_id.lower()
-            or q_lower in b.name.lower()
-            or q_lower in b.address.lower()
-            or q_lower in (b.building_type or "").lower()
-        ]
-
-    return [
-        {
+    items = []
+    now = date.today()
+    for b in buildings:
+        noc_expired = b.noc_valid_till < now if b.noc_valid_till else False
+        if expired_only and not noc_expired:
+            continue
+        items.append({
             "building_id": b.building_id,
             "name": b.name,
             "building_type": b.building_type,
             "address": b.address,
-            "noc_number": b.noc_number,
-            "noc_valid_till": str(b.noc_valid_till),
-            "noc_expired": b.noc_valid_till < date_type.today() if b.noc_valid_till else False,
-            "is_high_hazard": b.is_high_hazard,
+            "ward": b.ward,
+            "area_name": b.area_name,
             "floors_above_ground": b.floors_above_ground,
-            "total_height_metres": b.total_height_metres,
             "daytime_occupancy": b.daytime_occupancy,
-            "sprinkler_system": b.sprinkler_system,
-            "fire_alarm_make": b.fire_alarm_make,
-        }
-        for b in buildings
-    ]
+            "noc_valid_till": b.noc_valid_till.isoformat() if b.noc_valid_till else None,
+            "noc_expired": noc_expired,
+            "is_high_hazard": b.is_high_hazard,
+        })
+
+    return items
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WEBSOCKET ENDPOINTS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# HEALTH & INFO
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@app.get("/api/health")
-async def health():
-    return {
-        "status": "operational",
-        "service": "Corridoor API",
-        "version": "1.0.0",
-        "jurisdiction": "Thane Municipal Corporation",
-        "encryption": "All data encrypted in transit (TLS) and at rest. Zero-access architecture — Corridoor has no access to NOC data.",
-    }
+@app.websocket("/ws/station/{station_id}")
+async def station_ws(websocket: WebSocket, station_id: int):
+    await manager.connect_station(station_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_station(station_id, websocket)
+
+
+@app.websocket("/ws/alert/{alert_id}")
+async def alert_ws(websocket: WebSocket, alert_id: int):
+    await manager.connect_alert(alert_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_alert(alert_id, websocket)

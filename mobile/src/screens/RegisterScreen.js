@@ -36,7 +36,12 @@ export default function RegisterScreen({ onRegister }) {
 
     setSubmitting(true);
     try {
-      await onRegister(name.trim(), role, selectedBuilding.building_id);
+      await onRegister({
+          name: name.trim(),
+          role: role,
+          phone: null,
+          building_id: selectedBuilding.building_id,
+      });
     } catch (err) {
       Alert.alert('Error', err.message);
     } finally {

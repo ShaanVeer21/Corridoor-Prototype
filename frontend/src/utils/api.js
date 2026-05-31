@@ -1,6 +1,7 @@
 /**
- * Corridoor API Client
- * Centralized API calls to the FastAPI backend.
+ * Corridoor v2 — Frontend API Client
+ * Updated for new backend: NOC upload, floorplan upload, 
+ * floor-specific plans, photo uploads, responder login.
  */
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -12,7 +13,6 @@ async function request(endpoint, options = {}) {
     ...options,
   };
 
-  // Don't set Content-Type for FormData (file uploads)
   if (options.body instanceof FormData) {
     delete config.headers['Content-Type'];
   }
@@ -27,10 +27,20 @@ async function request(endpoint, options = {}) {
   return response.json();
 }
 
+// Encode building IDs that contain slashes (e.g., P-29345/2026)
+function encodeBuildingId(id) {
+  return encodeURIComponent(id);
+}
+
 // ── Buildings ──
 export const getBuildings = () => request('/api/buildings');
-export const getBuilding = (id) => request(`/api/buildings/${id}`);
-export const getNearestStation = (id) => request(`/api/buildings/${id}/station`);
+export const getBuilding = (id) => request(`/api/buildings/${encodeBuildingId(id)}`);
+export const getNearestStation = (id) => request(`/api/buildings/${encodeBuildingId(id)}/station`);
+
+// ── Floor Plans ──
+export const getFloorplans = (buildingId) => request(`/api/buildings/${encodeBuildingId(buildingId)}/floorplans`);
+export const getFloorplanForFloor = (buildingId, floorNumber) =>
+  request(`/api/buildings/${encodeBuildingId(buildingId)}/floorplans/floor/${floorNumber}`);
 
 // ── Fire Stations ──
 export const getStations = () => request('/api/stations');
@@ -38,6 +48,9 @@ export const getStations = () => request('/api/stations');
 // ── Users ──
 export const registerUser = (data) =>
   request('/api/users', { method: 'POST', body: JSON.stringify(data) });
+
+export const responderLogin = (data) =>
+  request('/api/responder/login', { method: 'POST', body: JSON.stringify(data) });
 
 // ── Alerts ──
 export const createAlert = (data) =>
@@ -61,24 +74,50 @@ export const updateAlertStatus = (alertId, status) =>
 export const sendUpdate = (data) =>
   request('/api/updates', { method: 'POST', body: JSON.stringify(data) });
 
+export const sendUpdateWithPhoto = async (formData) => {
+  const url = `${API_BASE}/api/updates/with-photo`;
+  const response = await fetch(url, {
+    method: 'POST',
+    body: formData, // FormData — no Content-Type header
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: 'Upload failed' }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+};
+
 export const getUpdates = (alertId) => request(`/api/updates/${alertId}`);
 
-// ── NOC ──
+// ── NOC Upload ──
+export const uploadNOC = async (file) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  return request('/api/noc/upload', { method: 'POST', body: formData });
+};
+
+export const uploadFloorplan = async (buildingId, file) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  return request(`/api/noc/upload/${encodeBuildingId(buildingId)}/floorplan`, {
+    method: 'POST',
+    body: formData,
+  });
+};
+
+// ── NOC Search ──
 export const searchNOC = (params = {}) => {
   const query = new URLSearchParams();
   if (params.q) query.set('q', params.q);
   if (params.hazard_only) query.set('hazard_only', 'true');
   if (params.expired_only) query.set('expired_only', 'true');
-  if (params.building_type) query.set('building_type', params.building_type);
+  if (params.ward) query.set('ward', params.ward);
   const qs = query.toString();
   return request(`/api/noc/search${qs ? `?${qs}` : ''}`);
 };
 
-export const uploadNOC = (file) => {
-  const formData = new FormData();
-  formData.append('file', file);
-  return request('/api/noc/upload', { method: 'POST', body: formData });
-};
+// ── Health ──
+export const getHealth = () => request('/api/health');
 
 // ── WebSocket ──
 export const connectStationWS = (stationId, onMessage) => {
@@ -91,7 +130,7 @@ export const connectStationWS = (stationId, onMessage) => {
   };
 
   ws.onerror = (err) => console.error('WebSocket error:', err);
-  ws.onclose = () => console.log('WebSocket disconnected');
+  ws.onclose = () => console.log(`Station ${stationId} WebSocket disconnected`);
 
   return ws;
 };
@@ -108,13 +147,23 @@ export const connectAlertWS = (alertId, onMessage) => {
   return ws;
 };
 
-// ── Health ──
-export const getHealth = () => request('/api/health');
-
-// ── Static files ──
+// ── Static file URLs ──
 export const getFloorplanUrl = (path) => {
   if (!path) return null;
-  // Strip leading path if present
-  const filename = path.replace('noc_data/', '');
-  return `${API_BASE}/static/${filename}`;
+  return `${API_BASE}/static/${path}`;
 };
+
+export const getPhotoUrl = (photoUrl) => {
+  if (!photoUrl) return null;
+  // photoUrl from API is like "/static/photos/filename.jpg"
+  if (photoUrl.startsWith('/')) {
+    return `${API_BASE}${photoUrl}`;
+  }
+  return `${API_BASE}/static/${photoUrl}`;
+};
+
+// NOC PDF viewer
+export const getNocPdfUrl = (buildingId) => {
+  return `${API_BASE}/api/noc/pdf/${encodeURIComponent(buildingId)}`;
+};
+

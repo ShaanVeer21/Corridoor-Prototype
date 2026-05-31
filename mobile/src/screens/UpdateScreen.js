@@ -1,43 +1,89 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet,
   SafeAreaView, ScrollView, Alert, KeyboardAvoidingView,
-  Platform, ActivityIndicator,
+  Platform, ActivityIndicator, Image,
 } from 'react-native';
-import { sendUpdate } from '../utils/api';
+import * as ImagePicker from 'expo-image-picker';
+import { sendUpdate, sendUpdateWithPhoto, getPhotoUrl } from '../utils/api';
 import { COLORS, SPACING, RADIUS, FONTS } from '../utils/theme';
 
 export default function UpdateScreen({ alert, user, onBack }) {
-  const [floorNumber, setFloorNumber] = useState('');
-  const [affectedArea, setAffectedArea] = useState('');
-  const [occupants, setOccupants] = useState('');
   const [message, setMessage] = useState('');
+  const [pendingPhoto, setPendingPhoto] = useState(null);
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState([]);
 
+  const handlePickPhoto = async () => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Camera roll permission is required to send photos');
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.7,
+      allowsEditing: false,
+    });
+    if (!result.canceled && result.assets?.[0]) {
+      setPendingPhoto(result.assets[0]);
+    }
+  };
+
+  const handleTakePhoto = async () => {
+    const { status } = await ImagePicker.requestCameraPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Camera permission is required to take photos');
+      return;
+    }
+    const result = await ImagePicker.launchCameraAsync({
+      quality: 0.7,
+      allowsEditing: false,
+    });
+    if (!result.canceled && result.assets?.[0]) {
+      setPendingPhoto(result.assets[0]);
+    }
+  };
+
   const handleSend = async () => {
-    if (!message.trim() && !floorNumber && !affectedArea) {
-      return Alert.alert('Required', 'Please enter at least a message or floor number');
+    if (!message.trim() && !pendingPhoto) {
+      return Alert.alert('Required', 'Enter a message or attach a photo');
     }
 
     setSending(true);
     try {
-      const update = await sendUpdate({
-        alert_id: alert.id,
-        sent_by: user.id,
-        floor_number: floorNumber ? parseInt(floorNumber) : null,
-        affected_area: affectedArea || null,
-        estimated_occupants: occupants ? parseInt(occupants) : null,
-        message: message.trim() || null,
-      });
+      let update;
 
-      setSent((prev) => [...prev, update]);
-      // Reset form but keep floor number
-      setAffectedArea('');
-      setOccupants('');
+      if (pendingPhoto) {
+        // Send with photo
+        const formData = new FormData();
+        formData.append('alert_id', alert.id);
+        formData.append('sent_by', user.id);
+        if (message.trim()) formData.append('message', message.trim());
+
+        const uri = pendingPhoto.uri;
+        const filename = uri.split('/').pop() || 'photo.jpg';
+        const match = /\.(\w+)$/.exec(filename);
+        const type = match ? `image/${match[1]}` : 'image/jpeg';
+
+        formData.append('photo', { uri, name: filename, type });
+
+        update = await sendUpdateWithPhoto(formData);
+      } else {
+        // Text only
+        update = await sendUpdate({
+          alert_id: alert.id,
+          sent_by: user.id,
+          message: message.trim(),
+        });
+      }
+
+      setSent((prev) => [...prev, {
+        ...update,
+        _localPhoto: pendingPhoto?.uri,
+      }]);
       setMessage('');
-
-      Alert.alert('Sent', 'Update delivered to fire station');
+      setPendingPhoto(null);
     } catch (err) {
       Alert.alert('Failed', err.message);
     } finally {
@@ -47,115 +93,83 @@ export default function UpdateScreen({ alert, user, onBack }) {
 
   return (
     <SafeAreaView style={styles.container}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        style={{ flex: 1 }}
-      >
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity onPress={onBack} style={styles.backBtn}>
-            <Text style={styles.backTxt}>← Back</Text>
-          </TouchableOpacity>
+          <TouchableOpacity onPress={onBack}><Text style={styles.backTxt}>← Back</Text></TouchableOpacity>
           <View style={styles.alertBadge}>
             <Text style={styles.alertBadgeDot}>●</Text>
-            <Text style={styles.alertBadgeTxt}>ACTIVE ALERT</Text>
+            <Text style={styles.alertBadgeTxt}>ALERT SENT</Text>
           </View>
         </View>
 
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-          {/* Alert info */}
-          <View style={styles.alertInfo}>
-            <Text style={styles.alertTitle}>Alert #{alert.id}</Text>
-            <Text style={styles.alertBuilding}>{alert.building_name || alert.building_id}</Text>
-            <Text style={styles.alertMeta}>
-              Sending live updates to fire station dashboard
-            </Text>
+          {/* Success banner */}
+          <View style={styles.successBanner}>
+            <Text style={styles.successIcon}>✅</Text>
+            <View>
+              <Text style={styles.successTitle}>Alert Sent</Text>
+              <Text style={styles.successSub}>Emergency services notified for {alert.building_name || alert.building_id}</Text>
+            </View>
           </View>
 
-          {/* Update form */}
-          <View style={styles.form}>
-            <Text style={styles.formTitle}>Send Update</Text>
+          {/* Live updates section label */}
+          <Text style={styles.sectionLabel}>SEND LIVE UPDATES</Text>
+          <Text style={styles.sectionSub}>Keep responders informed about the situation</Text>
 
-            <Text style={styles.label}>FLOOR NUMBER</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. 3"
-              placeholderTextColor={COLORS.textTertiary}
-              value={floorNumber}
-              onChangeText={setFloorNumber}
-              keyboardType="number-pad"
-            />
-
-            <Text style={styles.label}>AFFECTED AREA</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. West wing, Kitchen, Lobby"
-              placeholderTextColor={COLORS.textTertiary}
-              value={affectedArea}
-              onChangeText={setAffectedArea}
-            />
-
-            <Text style={styles.label}>ESTIMATED OCCUPANTS</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. 50"
-              placeholderTextColor={COLORS.textTertiary}
-              value={occupants}
-              onChangeText={setOccupants}
-              keyboardType="number-pad"
-            />
-
-            <Text style={styles.label}>MESSAGE</Text>
-            <TextInput
-              style={[styles.input, styles.inputMultiline]}
-              placeholder="Describe the situation — fire spreading, smoke visible, people trapped, exits blocked..."
-              placeholderTextColor={COLORS.textTertiary}
-              value={message}
-              onChangeText={setMessage}
-              multiline
-              numberOfLines={4}
-              textAlignVertical="top"
-            />
-
-            <TouchableOpacity
-              style={[styles.sendBtn, sending && styles.sendBtnDisabled]}
-              onPress={handleSend}
-              disabled={sending}
-            >
-              {sending ? (
-                <ActivityIndicator color={COLORS.white} />
-              ) : (
-                <Text style={styles.sendBtnTxt}>Send Update to Fire Station</Text>
+          {/* Sent items */}
+          {sent.map((item, i) => (
+            <View key={item.id || i} style={styles.sentItem}>
+              <Text style={styles.sentBy}>Sent by you</Text>
+              {item.message && <Text style={styles.sentMsg}>{item.message}</Text>}
+              {(item.photo_url || item._localPhoto) && (
+                <Image
+                  source={{ uri: item._localPhoto || getPhotoUrl(item.photo_url) }}
+                  style={styles.sentPhoto}
+                />
               )}
-            </TouchableOpacity>
-          </View>
+            </View>
+          ))}
 
-          {/* Sent updates log */}
-          {sent.length > 0 && (
-            <View style={styles.sentLog}>
-              <Text style={styles.sentTitle}>Updates Sent ({sent.length})</Text>
-              {sent.map((u, i) => (
-                <View key={u.id || i} style={styles.sentItem}>
-                  <Text style={styles.sentDot}>✓</Text>
-                  <View style={{ flex: 1 }}>
-                    {u.message && <Text style={styles.sentMsg}>{u.message}</Text>}
-                    <View style={styles.sentTags}>
-                      {u.floor_number != null && (
-                        <Text style={styles.sentTag}>Floor {u.floor_number}</Text>
-                      )}
-                      {u.affected_area && (
-                        <Text style={styles.sentTag}>{u.affected_area}</Text>
-                      )}
-                      {u.estimated_occupants != null && (
-                        <Text style={styles.sentTag}>{u.estimated_occupants} occupants</Text>
-                      )}
-                    </View>
-                  </View>
-                </View>
-              ))}
+          {/* Photo preview */}
+          {pendingPhoto && (
+            <View style={styles.photoPreview}>
+              <Image source={{ uri: pendingPhoto.uri }} style={styles.photoPreviewImg} />
+              <TouchableOpacity style={styles.photoRemove} onPress={() => setPendingPhoto(null)}>
+                <Text style={styles.photoRemoveTxt}>✕</Text>
+              </TouchableOpacity>
             </View>
           )}
         </ScrollView>
+
+        {/* Bottom input bar */}
+        <View style={styles.inputBar}>
+          <TouchableOpacity style={styles.cameraBtn} onPress={handleTakePhoto}>
+            <Text style={styles.cameraBtnTxt}>📷</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.cameraBtn} onPress={handlePickPhoto}>
+            <Text style={styles.cameraBtnTxt}>🖼️</Text>
+          </TouchableOpacity>
+          <TextInput
+            style={styles.messageInput}
+            placeholder="Type an update..."
+            placeholderTextColor={COLORS.textTertiary}
+            value={message}
+            onChangeText={setMessage}
+            multiline
+          />
+          <TouchableOpacity
+            style={[styles.sendBtn, sending && styles.sendBtnDisabled]}
+            onPress={handleSend}
+            disabled={sending}
+          >
+            {sending ? (
+              <ActivityIndicator color={COLORS.white} size="small" />
+            ) : (
+              <Text style={styles.sendBtnTxt}>➤</Text>
+            )}
+          </TouchableOpacity>
+        </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -163,68 +177,74 @@ export default function UpdateScreen({ alert, user, onBack }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.bgSecondary },
-
   header: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
     paddingHorizontal: SPACING.xl, paddingVertical: SPACING.lg,
     backgroundColor: COLORS.white, borderBottomWidth: 1, borderBottomColor: COLORS.borderLight,
   },
-  backBtn: { paddingVertical: SPACING.sm },
   backTxt: { fontSize: 14, color: COLORS.primary, fontWeight: '500' },
   alertBadge: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
-    backgroundColor: COLORS.hazard, paddingHorizontal: SPACING.md,
+    backgroundColor: COLORS.success, paddingHorizontal: SPACING.md,
     paddingVertical: SPACING.xs, borderRadius: RADIUS.full,
   },
   alertBadgeDot: { fontSize: 8, color: COLORS.white },
-  alertBadgeTxt: { fontSize: 10, fontWeight: '700', color: COLORS.white, letterSpacing: 0.5 },
+  alertBadgeTxt: { fontSize: 10, fontWeight: '700', color: COLORS.white },
 
-  scroll: { padding: SPACING.xl },
+  scroll: { padding: SPACING.xl, paddingBottom: 100 },
 
-  alertInfo: {
-    padding: SPACING.xl, backgroundColor: COLORS.hazardBg,
-    borderRadius: RADIUS.lg, borderWidth: 1, borderColor: COLORS.hazard,
-    marginBottom: SPACING.xl,
+  successBanner: {
+    flexDirection: 'row', alignItems: 'center', gap: SPACING.md,
+    padding: SPACING.lg, backgroundColor: COLORS.successBg,
+    borderRadius: RADIUS.lg, marginBottom: SPACING.xl,
   },
-  alertTitle: { fontSize: 13, fontFamily: 'monospace', color: COLORS.hazard, fontWeight: '700' },
-  alertBuilding: { fontSize: 18, fontWeight: '700', color: COLORS.textPrimary, marginTop: 4 },
-  alertMeta: { fontSize: 12, color: COLORS.textSecondary, marginTop: 4 },
+  successIcon: { fontSize: 24 },
+  successTitle: { fontSize: 20, fontWeight: '700', color: COLORS.textPrimary },
+  successSub: { fontSize: 13, color: COLORS.textSecondary, marginTop: 2 },
 
-  form: {
-    backgroundColor: COLORS.white, borderRadius: RADIUS.lg,
-    padding: SPACING.xxl, marginBottom: SPACING.xl,
-    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.06, shadowRadius: 8, elevation: 3,
+  sectionLabel: {
+    fontSize: 12, fontWeight: '700', color: COLORS.primary,
+    letterSpacing: 0.8, marginBottom: 2,
   },
-  formTitle: { fontSize: 18, fontWeight: '700', color: COLORS.textPrimary, marginBottom: SPACING.lg },
+  sectionSub: { fontSize: 12, color: COLORS.textTertiary, marginBottom: SPACING.lg },
 
-  label: { ...FONTS.label, fontSize: 11, marginBottom: SPACING.xs, marginTop: SPACING.lg },
-  input: {
-    borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.sm,
-    padding: SPACING.md, fontSize: 15, color: COLORS.textPrimary,
-    backgroundColor: COLORS.bgSecondary,
-  },
-  inputMultiline: { minHeight: 100, paddingTop: SPACING.md },
-
-  sendBtn: {
-    backgroundColor: COLORS.primary, borderRadius: RADIUS.sm,
-    padding: SPACING.lg, alignItems: 'center', marginTop: SPACING.xxl,
-  },
-  sendBtnDisabled: { opacity: 0.6 },
-  sendBtnTxt: { fontSize: 15, fontWeight: '700', color: COLORS.white },
-
-  sentLog: { marginBottom: SPACING.xxxl },
-  sentTitle: { fontSize: 14, fontWeight: '600', color: COLORS.textPrimary, marginBottom: SPACING.md },
   sentItem: {
-    flexDirection: 'row', gap: SPACING.md, padding: SPACING.md,
-    backgroundColor: COLORS.successBg, borderRadius: RADIUS.sm, marginBottom: SPACING.sm,
+    backgroundColor: COLORS.successBg, borderWidth: 1, borderColor: 'rgba(5,150,105,0.3)',
+    borderRadius: RADIUS.md, padding: SPACING.md, marginBottom: SPACING.sm,
   },
-  sentDot: { fontSize: 14, color: COLORS.success },
-  sentMsg: { fontSize: 13, color: COLORS.textPrimary, marginBottom: 4 },
-  sentTags: { flexDirection: 'row', gap: SPACING.sm, flexWrap: 'wrap' },
-  sentTag: {
-    fontSize: 11, color: COLORS.textSecondary,
-    backgroundColor: COLORS.bgTertiary, paddingHorizontal: 8,
-    paddingVertical: 2, borderRadius: RADIUS.full,
+  sentBy: { fontSize: 11, fontWeight: '700', color: COLORS.success, marginBottom: 4 },
+  sentMsg: { fontSize: 14, color: COLORS.textPrimary },
+  sentPhoto: { width: '100%', height: 180, borderRadius: RADIUS.md, marginTop: SPACING.sm },
+
+  photoPreview: { position: 'relative', marginBottom: SPACING.md },
+  photoPreviewImg: { width: '100%', height: 200, borderRadius: RADIUS.lg, borderWidth: 2, borderColor: COLORS.primary },
+  photoRemove: {
+    position: 'absolute', top: 8, right: 8, width: 28, height: 28,
+    borderRadius: 14, backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center', justifyContent: 'center',
   },
+  photoRemoveTxt: { color: COLORS.white, fontSize: 14, fontWeight: '700' },
+
+  inputBar: {
+    flexDirection: 'row', alignItems: 'flex-end', gap: SPACING.sm,
+    paddingHorizontal: SPACING.lg, paddingVertical: SPACING.md,
+    backgroundColor: COLORS.white, borderTopWidth: 1, borderTopColor: COLORS.borderLight,
+  },
+  cameraBtn: {
+    width: 40, height: 40, borderRadius: RADIUS.md,
+    backgroundColor: COLORS.bgTertiary, alignItems: 'center', justifyContent: 'center',
+  },
+  cameraBtnTxt: { fontSize: 18 },
+  messageInput: {
+    flex: 1, minHeight: 40, maxHeight: 100, borderWidth: 1,
+    borderColor: COLORS.border, borderRadius: RADIUS.lg,
+    paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm,
+    fontSize: 14, color: COLORS.textPrimary, backgroundColor: COLORS.bgSecondary,
+  },
+  sendBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center',
+  },
+  sendBtnDisabled: { opacity: 0.5 },
+  sendBtnTxt: { color: COLORS.white, fontSize: 18 },
 });

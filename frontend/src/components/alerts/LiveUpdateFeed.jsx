@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { getUpdates, connectAlertWS } from '../../utils/api';
+import { getUpdates, connectAlertWS, getPhotoUrl } from '../../utils/api';
 import { formatDateTime, timeAgo } from '../../utils/helpers';
 import './LiveUpdateFeed.css';
 
@@ -9,10 +9,8 @@ export default function LiveUpdateFeed({ alertId }) {
   const feedRef = useRef(null);
   const wsRef = useRef(null);
 
-  // Fetch existing updates
   useEffect(() => {
     if (!alertId) return;
-
     setLoading(true);
     getUpdates(alertId)
       .then(setUpdates)
@@ -20,21 +18,17 @@ export default function LiveUpdateFeed({ alertId }) {
       .finally(() => setLoading(false));
   }, [alertId]);
 
-  // WebSocket for live updates
   useEffect(() => {
     if (!alertId) return;
-
     const ws = connectAlertWS(alertId, (message) => {
       if (message.type === 'REAL_TIME_UPDATE') {
         setUpdates((prev) => [...prev, message.data]);
       }
     });
-
     wsRef.current = ws;
     return () => ws?.close();
   }, [alertId]);
 
-  // Auto-scroll to bottom on new update
   useEffect(() => {
     if (feedRef.current) {
       feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -68,6 +62,18 @@ export default function LiveUpdateFeed({ alertId }) {
 
               {upd.message && (
                 <p className="live-feed__message">{upd.message}</p>
+              )}
+
+              {/* Photo attachment */}
+              {upd.photo_url && (
+                <div className="live-feed__photo">
+                  <img
+                    src={getPhotoUrl(upd.photo_url)}
+                    alt="Update photo"
+                    className="live-feed__photo-img"
+                    onClick={() => window.open(getPhotoUrl(upd.photo_url), '_blank')}
+                  />
+                </div>
               )}
 
               <div className="live-feed__details">
